@@ -1,6 +1,6 @@
 # Canvas MCP server
 
-Let an AI assistant read your Canvas courses, assignments, grades, pages, modules, and PDFs.
+> Connect your Canvas account once. Then, ask about upcoming deadlines, find course materials and PDFs, or get a clear breakdown of your grades—with exact wording from your courses when you need it. **When it finds something, it can give you a direct Canvas link so you can open it immediately.**
 
 ## 1. Install
 
@@ -57,4 +57,4 @@ For clients that accept `mcpServers` JSON, use this example and replace both pat
 }
 ```
 
-Configuration formats vary by app; use its MCP instructions. Enable the server/tools and restart the app. Restart the MCP server after changing its code or `.env`.
+Configuration formats vary by app; use its MCP instructions. Enable the server/tools. Restart the MCP server after changing its code or `.env`.
