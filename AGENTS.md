@@ -1,4 +1,4 @@
-# Canvas assistant instructions
+# Canvas agent instructions
 
 - Keep all Canvas operations read-only. Never expose .env contents or tokens.
 - Use list_courses to resolve the user's course dynamically. If multiple sections or terms match, ask which one before reading course-specific information. Never hardcode course IDs, codes, years, module titles, or syllabus filenames.
