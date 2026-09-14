@@ -36,12 +36,12 @@ See the [Canvas token guide](https://community.instructure.com/en/kb/articles/66
 
 ## 3. Connect your agent
 
-In your AI app, go to MCP settings and add a server named `canvas`:
+In your AI app or `mcp.json`, go to MCP settings and add a server named `canvas`:
 
 | Setting | Windows | macOS / Linux |
 |---|---|---|
 | **Transport type** | `STDIO` | `STDIO` |
-| **Command to launch** | `C:/path/to/canvas-agent/.venv/Scripts/python.exe` | `/path/to/canvas-agent/.venv/bin/python` |
+| **Command** | `C:/path/to/canvas-agent/.venv/Scripts/python.exe` | `/path/to/canvas-agent/.venv/bin/python` |
 | **Arguments** | `C:/path/to/canvas-agent/canvas_server.py` | `/path/to/canvas-agent/canvas_server.py` |
 
 Configuration formats vary by app; use its MCP instructions. Enable the server/tools and restart the MCP server after changing code or `.env`.
