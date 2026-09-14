@@ -1,4 +1,4 @@
-# Canvas MCP server
+# Canvas Agent
 
 > Connect with your Canvas account once. Then, ask about upcoming deadlines, find course materials and PDFs, or get a breakdown of your grades. **Responses always use course-provided information and generates a Canvas link to open the page directly.**
 
@@ -53,7 +53,7 @@ Try asking:
 ```prompts
 What do I need on each of my remaining assessments to finish MATH101 with 85%?
 
-List every grade item worth more than 15% of final grade, include anything I need to watch out for, the weight and deadline.
+List every item > 15% of final grade, include anything important I need to watch out for, and the due date.
 
-List all assessments worth marks, expected course work, preparation details, required materials, and deadline for the next 7 days.
+List all assessments worth marks, expected course work, required materials, and deadline for the next 7 days.
 ```
