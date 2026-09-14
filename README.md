@@ -48,12 +48,12 @@ Configuration formats vary by app; use its MCP instructions. Enable the server/t
 
 ## Done!
 
-Try asking:
+You can customize [AGENTS.md](AGENTS.md) and try to ask:
 
 ```prompts
 What do I need on each of my remaining assessments to finish MATH101 with 85%?
 
-List every item > 15% of final grade, include anything important I need to watch out for, and the due date.
+List every item worth > 15% of final grade, include details I need to watch out for, and the due date.
 
-List all assessments worth marks, expected course work, required materials, and deadline for the next 7 days.
+List all my assessments worth marks, expected work, required materials, and deadline for the next 7 days.
 ```
