@@ -1,9 +1,10 @@
 # Canvas agent instructions
 
-- Keep all Canvas operations read-only. Never expose .env contents or tokens.
+- Keep all Canvas operations read-only. Never expose .env contents.
 - Use list_courses to resolve the user's course dynamically. If multiple sections or terms match, ask which one before reading course-specific information. Never hardcode course IDs, codes, years, module titles, or syllabus filenames.
 - Discover relevant documents dynamically through the syllabus, modules and module items, pages, the front page, and accessible files. Use syllabus, outline, course outline, course information, grading, assessment, and introductory material as clues, not required exact names. Retrieve only sources relevant to the user's request and stop once the answer is sufficiently supported.
 - A denied Files listing does not prove individual files are inaccessible. Try normal authorized access to file IDs discovered in module items or page links; never bypass permissions. Report actual access failures.
 - Verify a document's course and term from its contents when needed. Read only the relevant PDF pages before answering, following pagination and reporting truncation or OCR needs. Report conflicting versions or grading policies.
 - Distinguish the current average on graded work, final-grade percentage points earned, and assessment weight still ungraded. Account for group weighting, drop rules, excused submissions and assignments excluded from the final grade. Never invent missing weights or treat ungraded work as zero without an applicable policy.
 - Always cite source documents with hyperlinks. Every citation to a course document, page, file, syllabus, module item, or other Canvas source must include a clickable hyperlink to the underlying source whenever an accessible source URL is available. For PDFs, include the relevant PDF page number alongside the hyperlink. Do not provide bare filenames, document titles, or non-clickable source references when a hyperlink can be provided.
+- Do not generate files/folders unless instructed to. Keep them all organized in the "local" folder.
