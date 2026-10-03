@@ -1,9 +1,11 @@
 import os
 import re
 from urllib.parse import urljoin, urlsplit
-import tempfile
+from collections import OrderedDict
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
+from threading import RLock
 
 from bs4 import BeautifulSoup
 from canvasapi import Canvas
@@ -16,6 +18,22 @@ load_dotenv(Path(__file__).with_name(".env"))
 BASE = os.environ["CANVAS_URL"].rstrip("/")
 canvas = Canvas(BASE, os.environ["CANVAS_TOKEN"])
 mcp = FastMCP("Canvas Agent")
+
+# Session-only storage: never write Canvas documents to disk. Parsed readers
+# are transient; retained bytes and extracted UTF-8 text have a shared budget.
+PDF_MAX_BYTES = 30_000_000
+PDF_CACHE_BYTES = 64_000_000
+PDF_TEXT_LIMIT = 16000
+_pdf_cache = OrderedDict()
+_pdf_lock = RLock()
+
+
+def _trim_pdf_cache():
+    while _pdf_cache and (
+        len(_pdf_cache) > 8
+        or sum(entry["size"] for entry in _pdf_cache.values()) > PDF_CACHE_BYTES
+    ):
+        _pdf_cache.popitem(last=False)
 
 
 def plain(html):
@@ -112,48 +130,83 @@ def list_files(course_id: int) -> list:
 
 @mcp.tool()
 def read_pdf(
-    course_id: int, file_id: int, start_page: int = 1
+    course_id: int, file_id: int, start_page: int = 1,
+    page_count: int = 1, text_offset: int = 0,
 ) -> dict:
-    """Read up to five PDF pages. Page numbers start at 1.
-    Call again with the next start_page to continue reading.
-    Accept discovered file IDs even when the Files listing is denied.
+    """Read exact PDF text in memory; default one page, page_count allows 1-5.
+    Pages start at 1. Read only needed pages; next_page continues the document.
+    A page's next_offset continues truncated text with page_count=1 and
+    text_offset=next_offset on that same start_page. OCR warnings are explicit.
+    Accept discovered file IDs even when the Files listing is denied. Cite source.
     """
-    file = canvas.get_course(course_id).get_file(file_id)
-    if getattr(file, "size", 0) > 30_000_000:
-        return {"error": "PDF exceeds this starter tool's 30 MB limit."}
+    if not 1 <= page_count <= 5 or text_offset < 0:
+        return {"error": "page_count must be 1-5; text_offset must be nonnegative."}
+    if text_offset and page_count != 1:
+        return {"error": "Use page_count=1 when continuing text within a page."}
 
-    with tempfile.TemporaryDirectory() as folder:
-        path = Path(folder) / "document.pdf"
-        file.download(str(path))
-        reader = PdfReader(str(path))
-        total = len(reader.pages)
-
+    key = (course_id, file_id)
+    with _pdf_lock:
+        # Never use cached content before rechecking current authorized metadata.
+        try:
+            file = canvas.get_course(course_id).get_file(file_id)
+        except Exception:
+            _pdf_cache.pop(key, None)
+            raise
+        if getattr(file, "locked_for_user", False) or getattr(file, "hidden_for_user", False):
+            _pdf_cache.pop(key, None)
+            return {"error": "Canvas reports this file is unavailable to the current user."}
+        if (getattr(file, "size", 0) or 0) > PDF_MAX_BYTES:
+            _pdf_cache.pop(key, None)
+            return {"error": "PDF exceeds the 30 MB limit."}
+        version = (getattr(file, "updated_at", None),
+                   getattr(file, "modified_at", None), getattr(file, "size", None))
+        # Without a modification marker, freshness cannot be established.
+        cacheable = bool(version[0] or version[1])
+        entry = _pdf_cache.pop(key, None)
+        reader = None
+        if not cacheable or entry is None or entry["version"] != version:
+            raw = file.get_contents(binary=True)
+            if len(raw) > PDF_MAX_BYTES:
+                return {"error": "PDF exceeds the 30 MB limit."}
+            reader = PdfReader(BytesIO(raw))
+            entry = {"version": version, "raw": raw, "total": len(reader.pages),
+                     "texts": {}, "size": len(raw)}
+        if cacheable:
+            _pdf_cache[key] = entry
+        total = entry["total"]
         if not 1 <= start_page <= total:
+            _trim_pdf_cache()
             return {"error": "Invalid page number.", "total_pages": total}
-
-        end = min(start_page + 4, total)
+        end = min(start_page + page_count - 1, total)
         pages = []
-        for number in range(start_page, end + 1):
-            text = reader.pages[number - 1].extract_text() or ""
-            pages.append({
-                "page": number,
-                "text": text[:16000],
-                "truncated": len(text) > 16000,
-                "characters_total": len(text),
-                "needs_ocr": not bool(text.strip()),
-                "status": "No extractable text; page may be scanned and need OCR."
-                          if not text.strip() else "Text extracted",
-            })
+        try:
+            for number in range(start_page, end + 1):
+                if number not in entry["texts"]:
+                    if reader is None:
+                        reader = PdfReader(BytesIO(entry["raw"]))
+                    text = reader.pages[number - 1].extract_text() or ""
+                    entry["texts"][number] = text
+                    entry["size"] += len(text.encode("utf-8"))
+                text = entry["texts"][number]
+                if text_offset and text_offset >= len(text):
+                    return {"error": "text_offset is beyond the page text.",
+                            "page": number, "characters_total": len(text)}
+                stop = text_offset + PDF_TEXT_LIMIT
+                row = {"page": number, "text": text[text_offset:stop]}
+                if stop < len(text):
+                    row.update(truncated=True, next_offset=stop, characters_total=len(text))
+                if text_offset:
+                    row["text_offset"] = text_offset
+                if not text.strip():
+                    row["needs_ocr"] = True
+                pages.append(row)
+        finally:
+            _trim_pdf_cache()
 
     return {
         "filename": getattr(file, "display_name", str(file_id)),
         "source": f"{BASE}/courses/{course_id}/files/{file_id}",
         "total_pages": total,
-        "start_page": start_page,
-        "end_page": end,
-        "text_character_limit_per_page": 16000,
-        "truncated": any(p["truncated"] for p in pages),
-        "needs_ocr_pages": [p["page"] for p in pages if p["needs_ocr"]],
         "pages": pages,
         "next_page": end + 1 if end < total else None,
     }
