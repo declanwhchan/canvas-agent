@@ -1,6 +1,6 @@
 # Canvas Agent
 
-> Connect with your Canvas account once. Then, ask about upcoming deadlines, find course materials and PDFs, or get a breakdown of your grades. **Responses always use course-provided information and generates a Canvas link to open the page directly.**
+> Connect with your Canvas account once. Then, ask about upcoming deadlines, find course materials and PDFs, or get a breakdown of your grades. Responses always use course-provided information and generates a Canvas link to open the page directly.
 
 ## 1. Installation
 
@@ -53,7 +53,7 @@ You can customize [AGENTS.md](AGENTS.md) and try to ask:
 ```prompts
 What do I need on each of my remaining assessments to finish MATH101 with 85%?
 
-List every item worth > 15% of final grade, include details I need to watch out for, and the due date.
+List every item worth at least 15% of my final grade, include preparation details and due date.
 
-List all my assessments worth marks, expected work, required materials, and deadline for the next 7 days.
+List all my weighted assessments, expected work, required materials, and deadline for the next 7 days.
 ```
