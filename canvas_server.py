@@ -36,12 +36,6 @@ def _trim_pdf_cache():
         _pdf_cache.popitem(last=False)
 
 
-def plain(html):
-    return BeautifulSoup(html or "", "html.parser").get_text(
-        " ", strip=True
-    )
-
-
 def pick(obj, *fields):
     return {field: getattr(obj, field, None) for field in fields}
 
@@ -63,7 +57,7 @@ def list_courses() -> list:
 
 @mcp.tool()
 def assignments_and_marks(course_id: int) -> list:
-    """Read assignments, due dates and my visible submission marks."""
+    """Read assignments, description links and file IDs, due dates and my marks."""
     course = canvas.get_course(course_id)
     result = []
     for a in course.get_assignments(include=["submission"]):
@@ -72,7 +66,13 @@ def assignments_and_marks(course_id: int) -> list:
             "html_url", "submission", "has_overrides", "assignment_group_id",
             "omit_from_final_grade", "published", "grading_type"
         )
-        row["description"] = plain(getattr(a, "description", ""))
+        description = document(
+            getattr(a, "description", ""),
+            row["html_url"] or f"{BASE}/courses/{course_id}/assignments/{a.id}",
+        )
+        row["description"] = description["text"]
+        row["links"] = description["links"]
+        row["source"] = description["source"]
         result.append(row)
     return result
 
