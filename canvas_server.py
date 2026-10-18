@@ -57,24 +57,81 @@ def list_courses() -> list:
 
 @mcp.tool()
 def assignments_and_marks(course_id: int) -> list:
-    """Read assignments, description links and file IDs, due dates and my marks."""
+    """Discover assignments by name in a resolved course; no user-supplied URL needed.
+    Return assignment IDs, descriptions, linked file IDs, due dates and my marks.
+    Follow relevant linked PDFs with read_pdf using the returned IDs.
+    """
     course = canvas.get_course(course_id)
-    result = []
-    for a in course.get_assignments(include=["submission"]):
-        row = pick(
-            a, "id", "name", "due_at", "points_possible",
-            "html_url", "submission", "has_overrides", "assignment_group_id",
-            "omit_from_final_grade", "published", "grading_type"
-        )
-        description = document(
-            getattr(a, "description", ""),
-            row["html_url"] or f"{BASE}/courses/{course_id}/assignments/{a.id}",
-        )
-        row["description"] = description["text"]
-        row["links"] = description["links"]
-        row["source"] = description["source"]
-        result.append(row)
-    return result
+    return [_assignment_details(a, course_id)
+            for a in course.get_assignments(include=["submission"])]
+
+
+def _assignment_details(assignment, course_id):
+    row = pick(
+        assignment, "id", "name", "due_at", "points_possible", "html_url",
+        "submission", "has_overrides", "assignment_group_id",
+        "omit_from_final_grade", "published", "grading_type",
+        "submission_types", "allowed_extensions", "unlock_at", "lock_at",
+        "locked_for_user", "lock_explanation", "rubric", "rubric_settings",
+    )
+    description = document(
+        getattr(assignment, "description", ""),
+        row["html_url"] or f"{BASE}/courses/{course_id}/assignments/{assignment.id}",
+    )
+    row["description"] = description.pop("text")
+    row.update(description)
+    return row
+
+
+@mcp.tool()
+def read_assignment(course_id: int, assignment_id: int) -> dict:
+    """Read one assignment's full API description, links, rubric and submission rules.
+    Use IDs discovered by assignments_and_marks or list_module_items; no pasted link needed.
+    Linked documents are separate sources: follow relevant file links with read_pdf.
+    """
+    assignment = canvas.get_course(course_id).get_assignment(
+        assignment_id, include=["submission"]
+    )
+    return _assignment_details(assignment, course_id)
+
+
+@mcp.tool()
+def read_canvas_url(
+    url: str, start_page: int = 1, page_count: int = 1, text_offset: int = 0,
+) -> dict:
+    """Read a course assignment, page, syllabus, front page or PDF from its Canvas URL.
+    Optional shortcut for agent-discovered or user-provided links. Normally discover
+    the course and assignment through list_courses and assignments_and_marks first.
+    Only this configured Canvas origin is supported; uses read-only API calls.
+    PDF pagination is the same as read_pdf. Return links without crawling them.
+    """
+    try:
+        target = urlsplit(url)
+    except ValueError:
+        return {"error": "Invalid Canvas URL."}
+    origin = urlsplit(BASE)
+    if (target.scheme not in ("http", "https")
+            or target.scheme != origin.scheme or target.netloc != origin.netloc
+            or target.username is not None or target.password is not None):
+        return {"error": "URL must belong to the configured Canvas origin."}
+    match = re.fullmatch(r"/(?:api/v1/)?courses/(\d+)/(.*?)/?", target.path)
+    if not match:
+        return {"error": "Use a course-scoped Canvas assignment, page or file URL."}
+    course_id, resource = int(match[1]), match[2]
+    if resource == "assignments/syllabus":
+        return syllabus(course_id)
+    assignment = re.fullmatch(r"assignments/(\d+)", resource)
+    if assignment:
+        return read_assignment(course_id, int(assignment[1]))
+    if resource in ("front_page", "pages/front_page"):
+        return read_front_page(course_id)
+    page = re.fullmatch(r"pages/([^/]+)", resource)
+    if page:
+        return read_page(course_id, page[1])
+    file = re.fullmatch(r"files/(\d+)(?:/(?:download|preview))?", resource)
+    if file:
+        return read_pdf(course_id, int(file[1]), start_page, page_count, text_offset)
+    return {"error": "Unsupported Canvas URL. Use an assignment, page, syllabus, front page or PDF URL."}
 
 
 @mcp.tool()
@@ -152,9 +209,20 @@ def read_pdf(
         except Exception:
             _pdf_cache.pop(key, None)
             raise
-        if getattr(file, "locked_for_user", False) or getattr(file, "hidden_for_user", False):
+        access = pick(file, "hidden_for_user", "locked_for_user", "unlock_at",
+                      "lock_at", "lock_explanation")
+        # Hidden files can be available through assignment/module links. Canvas's
+        # authenticated download still enforces access; hiding alone is no lock.
+        if getattr(file, "locked_for_user", False):
             _pdf_cache.pop(key, None)
-            return {"error": "Canvas reports this file is unavailable to the current user."}
+            return {"error": "Canvas reports this file is locked for the current user.",
+                    "source": f"{BASE}/courses/{course_id}/files/{file_id}",
+                    "access": access}
+        if not getattr(file, "url", None):
+            _pdf_cache.pop(key, None)
+            return {"error": "Canvas did not provide an authorized download URL for this file.",
+                    "source": f"{BASE}/courses/{course_id}/files/{file_id}",
+                    "access": access}
         if (getattr(file, "size", 0) or 0) > PDF_MAX_BYTES:
             _pdf_cache.pop(key, None)
             return {"error": "PDF exceeds the 30 MB limit."}
@@ -206,6 +274,7 @@ def read_pdf(
     return {
         "filename": getattr(file, "display_name", str(file_id)),
         "source": f"{BASE}/courses/{course_id}/files/{file_id}",
+        "access": access,
         "total_pages": total,
         "pages": pages,
         "next_page": end + 1 if end < total else None,
@@ -232,7 +301,17 @@ def document(body, source):
         links.append(row)
     for tag in soup(["script", "style"]):
         tag.decompose()
-    return {"text": soup.get_text(" ", strip=True), "links": links, "source": source}
+    media = []
+    for tag in soup.find_all(["img", "iframe", "embed", "object", "video", "audio", "source"]):
+        value = tag.get("data") if tag.name == "object" else tag.get("src")
+        if not value:
+            continue
+        href = urljoin(source, value)
+        if urlsplit(href).scheme in ("http", "https"):
+            media.append({"type": tag.name, "href": href,
+                          "text": tag.get("alt") or tag.get("title") or ""})
+    return {"text": soup.get_text(" ", strip=True), "links": links,
+            "media": media, "source": source}
 
 
 @mcp.tool()

@@ -46,6 +46,36 @@ In your AI app or `mcp.json`, go to MCP settings and add a server named `canvas`
 
 Configuration formats vary by app; use its MCP instructions. Enable the server/tools and restart the MCP server after changing code or `.env`.
 
+## Reading assignment and file links
+
+Ask naturally, for example: "Give me everything I need to do for lab 3 in my
+digital systems course." The agent resolves your course, finds the assignment,
+and follows relevant linked instructions automatically. You do not need to paste
+links, look up IDs, or name tools. It asks for clarification only if multiple
+courses or assignments remain plausible, and reports actual access failures.
+
+`read_assignment` retrieves an assignment using IDs discovered from the course's
+assignments or module items, including its description, linked documents, rubric,
+submission settings, and references to embedded images or videos. `read_canvas_url`
+is an optional shortcut for links the agent discovers or you choose to provide.
+Embedded media are listed as references, not rendered or transcribed. The agent
+reads relevant linked documents separately rather than fetching every attachment.
+
+PDFs remain in memory and support page-by-page reading with `read_pdf` or
+`read_canvas_url`. A file hidden from the Files list may still be available from an
+assignment or module link. Hidden status alone does not block reading; an actual
+user lock, an API access denial, or a download denial still does. Lock responses
+include the available lock explanation and dates. No Canvas permissions are changed.
+
+After updating this repo, **restart the Canvas MCP server and refresh its tools**
+in your client so the new URL reader and file-access fix are loaded.
+
+Offline regression checks (Windows):
+
+```powershell
+.\.venv\Scripts\python.exe -B -m unittest discover -s local -p "test_*.py"
+```
+
 ## Done!
 
 You can customize [AGENTS.md](AGENTS.md) and try to ask:
@@ -53,7 +83,5 @@ You can customize [AGENTS.md](AGENTS.md) and try to ask:
 ```prompts
 What do I need on each of my remaining assessments to finish MATH101 with 85%?
 
-List every item worth at least 15% of my final grade, include preparation details and due date.
-
-List all my weighted assessments, expected work, required materials, and deadline for the next 7 days.
+List all my weighted assessments, expected work, required materials, and deadline for the next 14 days.
 ```
