@@ -4,11 +4,13 @@ import os
 import re
 from urllib.parse import urljoin, urlsplit
 from collections import OrderedDict
+from contextlib import contextmanager
 from datetime import datetime
 from functools import wraps
 from io import BytesIO
 from pathlib import Path
 from threading import RLock, local
+from time import monotonic
 
 from bs4 import BeautifulSoup
 from canvasapi import Canvas
@@ -27,6 +29,9 @@ mcp = FastMCP("Canvas Agent")
 _origin = urlsplit(BASE)
 _clients = local()
 _tool_slots = asyncio.Semaphore(4)
+_courses_lock = RLock()
+_courses_cache = ()
+_courses_expires = 0.0
 
 
 class _ReadOnlySession(Session):
@@ -97,6 +102,11 @@ def pick(obj, *fields):
     return {field: value for field in fields if (value := get(field)) is not None}
 
 
+def _matches(text, query):
+    text = re.sub(r"[\W_]+", "", text.casefold())
+    return all(re.sub(r"[\W_]+", "", word.casefold()) in text for word in query.split())
+
+
 @tool
 def current_time() -> str:
     """Get the current date, time and local UTC offset."""
@@ -104,8 +114,21 @@ def current_time() -> str:
 
 
 @tool
-def list_courses() -> list:
-    """Resolve active courses and terms; ask only if ambiguous."""
+def list_courses(search: str = "", refresh: bool = False) -> list:
+    """Find active courses/terms; search by code/title/term. Cached 900s; refresh=true bypasses cache."""
+    global _courses_cache, _courses_expires
+    with _courses_lock:
+        if refresh or monotonic() >= _courses_expires:
+            # Never retain a successful discovery after an explicit refresh fails.
+            _courses_cache, _courses_expires = (), 0.0
+            _courses_cache = _load_courses()
+            _courses_expires = monotonic() + 900
+        return [row for row in _courses_cache if not search or _matches(
+            " ".join(str(row.get(field, "")) for field in ("name", "course_code", "term")), search,
+        )]
+
+
+def _load_courses():
     rows = []
     for course in _client().get_courses(enrollment_state="active", include=["term"]):
         row = pick(course, "id", "name", "course_code", "start_at", "end_at")
@@ -221,11 +244,12 @@ def syllabus(course_id: int) -> dict:
 
 
 @tool
-def list_pages(course_id: int) -> list:
-    """List course pages to locate policies and course information."""
+def list_pages(course_id: int, search: str = "") -> list:
+    """Find course pages; optional title search."""
     return [
         pick(p, "title", "url", "html_url")
         for p in _course(course_id).get_pages()
+        if not search or _matches(getattr(p, "title", ""), search)
     ]
 
 
@@ -276,19 +300,10 @@ def _download_pdf(file):
             return data.getvalue()
 
 
-@tool
-def read_pdf(
-    course_id: int, file_id: int, start_page: int = 1,
-    page_count: int = 1, text_offset: int = 0,
-) -> dict:
-    """Read cached PDF pages in memory (1-based; page_count 1-5). Follow next_page; for truncated text use next_offset as text_offset on the same page with page_count=1. Report needs_ocr. Cite source and page."""
-    if start_page < 1 or not 1 <= page_count <= 5 or text_offset < 0:
-        return {"error": "start_page must be positive; page_count 1-5; text_offset nonnegative."}
-    if text_offset and page_count != 1:
-        return {"error": "Use page_count=1 when continuing text within a page."}
-
+@contextmanager
+def _pdf_document(course_id, file_id):
     key = (course_id, file_id)
-    source = f"{BASE}/courses/{course_id}/files/{file_id}"
+    meta = {"source": f"{BASE}/courses/{course_id}/files/{file_id}"}
     with _pdf_locks[hash(key) % len(_pdf_locks)]:
         # Never use cached content before rechecking current authorized metadata.
         try:
@@ -296,21 +311,22 @@ def read_pdf(
         except Exception:
             _discard_pdf(key)
             raise
-        access = pick(file, "hidden_for_user", "locked_for_user", "unlock_at",
-                      "lock_at", "lock_explanation")
+        meta["filename"] = getattr(file, "display_name", str(file_id))
+        meta["access"] = pick(file, "hidden_for_user", "locked_for_user", "unlock_at",
+                              "lock_at", "lock_explanation")
         # Hidden files can be available through assignment/module links. Canvas's
         # authenticated download still enforces access; hiding alone is no lock.
+        error = None
         if getattr(file, "locked_for_user", False):
+            error = "Canvas reports this file is locked for the current user."
+        elif not getattr(file, "url", None):
+            error = "Canvas did not provide an authorized download URL for this file."
+        elif (getattr(file, "size", 0) or 0) > PDF_MAX_BYTES:
+            error = "PDF exceeds the 30 MB limit."
+        if error:
             _discard_pdf(key)
-            return {"error": "Canvas reports this file is locked for the current user.",
-                    "source": source, "access": access}
-        if not getattr(file, "url", None):
-            _discard_pdf(key)
-            return {"error": "Canvas did not provide an authorized download URL for this file.",
-                    "source": source, "access": access}
-        if (getattr(file, "size", 0) or 0) > PDF_MAX_BYTES:
-            _discard_pdf(key)
-            return {"error": "PDF exceeds the 30 MB limit.", "source": source}
+            yield {"error": error}, meta
+            return
         version = (getattr(file, "updated_at", None),
                    getattr(file, "modified_at", None), getattr(file, "size", None),
                    getattr(file, "md5", None))
@@ -318,56 +334,102 @@ def read_pdf(
         cacheable = bool(version[0] or version[1])
         with _pdf_lock:
             entry = _pdf_cache.pop(key, None)
-            if cacheable and entry is not None and entry["version"] == version:
-                _pdf_cache[key] = entry
         if not cacheable or entry is None or entry["version"] != version:
             raw = _download_pdf(file)
             reader = PdfReader(BytesIO(raw))
             entry = {"version": version, "reader": reader, "total": len(reader.pages),
                      "texts": {}, "size": len(raw)}
             del raw
-        total = entry["total"]
-        if not 1 <= start_page <= total:
-            with _pdf_lock:
-                _trim_pdf_cache()
-            return {"error": "Invalid page number.", "total_pages": total, "source": source}
-        end = min(start_page + page_count - 1, total)
-        pages = []
         try:
-            for number in range(start_page, end + 1):
-                if number not in entry["texts"]:
-                    text = entry["reader"].pages[number - 1].extract_text() or ""
-                    entry["texts"][number] = text
-                    with _pdf_lock:
-                        entry["size"] += len(text.encode("utf-8"))
-                text = entry["texts"][number]
-                if text_offset and text_offset >= len(text):
-                    return {"error": "text_offset is beyond the page text.",
-                            "page": number, "characters_total": len(text), "source": source}
-                stop = text_offset + PDF_TEXT_LIMIT
-                row = {"page": number, "text": text[text_offset:stop]}
-                if stop < len(text):
-                    row.update(truncated=True, next_offset=stop, characters_total=len(text))
-                if text_offset:
-                    row["text_offset"] = text_offset
-                if not text.strip():
-                    row["needs_ocr"] = True
-                pages.append(row)
+            yield entry, meta
         finally:
             with _pdf_lock:
                 if cacheable:
                     _pdf_cache[key] = entry
-                    _pdf_cache.move_to_end(key)
                 _trim_pdf_cache()
 
-    return {
-        "filename": getattr(file, "display_name", str(file_id)),
-        "source": source,
-        "access": access,
-        "total_pages": total,
-        "pages": pages,
-        "next_page": end + 1 if end < total else None,
-    }
+
+def _page_text(entry, number):
+    if number not in entry["texts"]:
+        text = entry["reader"].pages[number - 1].extract_text() or ""
+        entry["texts"][number] = text
+        entry["size"] += len(text.encode("utf-8"))
+    return entry["texts"][number]
+
+
+@tool
+def read_pdf(
+    course_id: int, file_id: int, start_page: int = 1,
+    page_count: int = 1, text_offset: int = 0,
+) -> dict:
+    """Read PDF pages in memory (1-based; page_count 1-5). Follow next_page; truncated text: same page, page_count=1, text_offset=next_offset. Report needs_ocr. Cite source/page. Use search_pdf to locate text."""
+    if start_page < 1 or not 1 <= page_count <= 5 or text_offset < 0:
+        return {"error": "start_page must be positive; page_count 1-5; text_offset nonnegative."}
+    if text_offset and page_count != 1:
+        return {"error": "Use page_count=1 when continuing text within a page."}
+
+    with _pdf_document(course_id, file_id) as (entry, meta):
+        if "error" in entry:
+            return {**meta, **entry}
+        total = entry["total"]
+        if not 1 <= start_page <= total:
+            return {**meta, "error": "Invalid page number.", "total_pages": total}
+        end = min(start_page + page_count - 1, total)
+        pages = []
+        for number in range(start_page, end + 1):
+            text = _page_text(entry, number)
+            if text_offset and text_offset >= len(text):
+                return {**meta, "error": "text_offset is beyond the page text.",
+                        "page": number, "characters_total": len(text)}
+            stop = text_offset + PDF_TEXT_LIMIT
+            row = {"page": number, "text": text[text_offset:stop]}
+            if stop < len(text):
+                row.update(truncated=True, next_offset=stop, characters_total=len(text))
+            if text_offset:
+                row["text_offset"] = text_offset
+            if not text.strip():
+                row["needs_ocr"] = True
+            pages.append(row)
+        return {**meta, "total_pages": total, "pages": pages,
+                "next_page": end + 1 if end < total else None}
+
+
+@tool
+def search_pdf(
+    course_id: int, file_id: int, query: str, start_page: int = 1,
+    page_count: int = 20, max_results: int = 5,
+) -> dict:
+    """Find text in PDF pages (max 50/call); first matching snippet per page. Follow next_page; read_pdf for context. Report needs_ocr_pages. Uses shared cache and current access checks."""
+    query = query.strip()
+    if (not 1 <= len(query) <= 200 or start_page < 1
+            or not 1 <= page_count <= 50 or not 1 <= max_results <= 10):
+        return {"error": "query must be 1-200 characters; start_page positive; page_count 1-50; max_results 1-10."}
+    pattern = re.compile(r"\s+".join(re.escape(word) for word in query.split()), re.IGNORECASE)
+    with _pdf_document(course_id, file_id) as (entry, meta):
+        if "error" in entry:
+            return {**meta, **entry}
+        total = entry["total"]
+        if start_page > total:
+            return {**meta, "error": "Invalid page number.", "total_pages": total}
+        end = min(start_page + page_count - 1, total)
+        matches, ocr = [], []
+        for number in range(start_page, end + 1):
+            text = _page_text(entry, number)
+            if not text.strip():
+                ocr.append(number)
+            match = pattern.search(text)
+            if match:
+                offset = max(0, match.start() - 160)
+                matches.append({"page": number, "snippet": text[offset:min(match.end() + 160, offset + 520)],
+                                "text_offset": offset})
+                if len(matches) >= max_results:
+                    break
+        result = {**meta, "total_pages": total, "matches": matches,
+                  "scanned_pages": {"first": start_page, "last": number},
+                  "next_page": number + 1 if number < total else None}
+        if ocr:
+            result["needs_ocr_pages"] = ocr
+        return result
 
 
 
@@ -426,26 +488,38 @@ def read_front_page(course_id: int) -> dict:
 
 
 @tool
-def list_modules(course_id: int) -> list:
-    """Discover course modules dynamically, including introductory material."""
-    return [dict(pick(m, "id", "name", "position", "items_count"),
-                 source=f"{BASE}/courses/{course_id}/modules/{m.id}")
-            for m in _course(course_id).get_modules()]
+def list_modules(course_id: int, search: str = "", include_items: bool = False) -> list:
+    """Find modules; optional title search. include_items=true previews items in one request; items_complete=false needs list_module_items."""
+    params = {"include": ["items"]} if include_items else {}
+    result = []
+    for module in _course(course_id).get_modules(**params):
+        if search and not _matches(getattr(module, "name", ""), search):
+            continue
+        row = dict(pick(module, "id", "name", "position", "items_count"),
+                   source=f"{BASE}/courses/{course_id}/modules/{module.id}")
+        if include_items:
+            row["items"] = [_module_item_details(item, course_id)
+                            for item in (getattr(module, "items", None) or [])]
+            count = getattr(module, "items_count", None)
+            row["items_complete"] = isinstance(count, int) and len(row["items"]) >= count
+        result.append(row)
+    return result
+
+
+def _module_item_details(item, course_id):
+    row = pick(item, "id", "title", "type", "content_id", "page_url", "html_url", "external_url")
+    row["source"] = row.get("html_url") or f"{BASE}/courses/{course_id}/modules/items/{row['id']}"
+    if row.get("type") == "File" and row.get("content_id") is not None:
+        row["file_id"] = row["content_id"]
+        row["file_source"] = f"{BASE}/courses/{course_id}/files/{row['content_id']}"
+    return row
 
 
 @tool
 def list_module_items(course_id: int, module_id: int) -> list:
     """Find files and pages even when the course Files listing is denied."""
     module = Module(_requester(), {"id": module_id, "course_id": course_id})
-    result = []
-    for item in module.get_module_items():
-        row = pick(item, "id", "title", "type", "content_id", "page_url", "html_url", "external_url")
-        row["source"] = row.get("html_url") or f"{BASE}/courses/{course_id}/modules/items/{item.id}"
-        if row.get("type") == "File" and row.get("content_id") is not None:
-            row["file_id"] = row["content_id"]
-            row["file_source"] = f"{BASE}/courses/{course_id}/files/{row['content_id']}"
-        result.append(row)
-    return result
+    return [_module_item_details(item, course_id) for item in module.get_module_items()]
 
 
 @tool

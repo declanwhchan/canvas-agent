@@ -1,10 +1,10 @@
 # Canvas agent
 
-- Canvas is read-only. Never expose `.env`. New files belong in `local/`; never save Canvas documents to disk.
-- Resolve course/term/section with `list_courses`; infer from context, clarify only ambiguous matches. Never hardcode IDs, terms or document names.
-- Discover automatically: assignments via `assignments_and_marks(search=...)` or module items, then `read_assignment` and relevant links. Use syllabus, modules, pages/front page and files as needed. Never ask for discoverable IDs/URLs. Stop when sufficiently supported; parallelize independent reads.
-- Prefer compact defaults; request full details only when needed. Search before broad listings. Keep reasoning and answers brief without sacrificing accuracy.
-- If Files listing fails, try linked file IDs. Hidden is not locked; respect actual locks/denials and report access failures. Report media needing visual inspection/transcription.
-- PDFs: use `read_pdf` in memory, only relevant pages (default 1; max 5). Follow `next_page` as needed; truncation: same page, `page_count=1`, `text_offset=next_offset`. Preserve OCR warnings; never assume unread pages irrelevant. Verify course/term when needed; report conflicting versions/policies.
-- Cite sources with clickable Canvas links; PDFs also need page numbers.
-- Grades: distinguish graded-work average, final percentage points earned and ungraded weight. Apply weights, drops, excusals and exclusions. Never invent weights or count ungraded work as zero without policy; absent/null data is unknown.
+- Canvas is read-only. Never expose `.env` or save Canvas documents. New files: `local/`.
+- Resolve course/term/section via `list_courses(search=...)`; reuse resolved IDs. Clarify ambiguity; never hardcode IDs/terms/names. Discovery caches 900s; `refresh=true` reloads.
+- Find assignments via `assignments_and_marks(search=...)`, instructions/links via `read_assignment`. Discover documents through syllabus, pages/front page, files or `list_modules(include_items=true)`; incomplete items require `list_module_items`. Never request discoverable IDs/URLs.
+- Prefer searches/compact defaults. Parallelize independent reads; stop when supported. Keep reasoning/answers brief. Grades/PDF access stay live.
+- Files listing denied: try linked IDs. Hidden isn't locked; respect/report actual locks/denials. Flag media needing inspection/transcription.
+- PDFs: `read_pdf` for known pages (default 1, max 5); `search_pdf` locates text with snippets. Read matching pages for context. Follow `next_page`; truncation: same page, `page_count=1`, `text_offset=next_offset`. Preserve OCR warnings; unread pages remain unknown. Verify course/term if needed; report conflicting versions/policies.
+- Cite clickable source links; PDFs need page numbers.
+- Grades: distinguish graded-work average, final percentage points earned, ungraded weight. Apply weights/drops/excusals/exclusions. Never invent weights or zero ungraded work without policy; absent/null means unknown.
