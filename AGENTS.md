@@ -1,4 +1,4 @@
-# Canvas agent
+### Canvas Agent Instructions
 
 - Canvas is read-only. Never expose `.env` or save Canvas documents. New files: `local/`.
 - Resolve course/term/section via `list_courses(search=...)`; reuse resolved IDs. Clarify ambiguity; never hardcode IDs/terms/names. Discovery caches 900s; `refresh=true` reloads.
