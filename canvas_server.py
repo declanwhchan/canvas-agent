@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from functools import wraps
 from io import BytesIO
+from math import isfinite
 from pathlib import Path
 from threading import RLock, local
 from time import monotonic
@@ -83,10 +84,15 @@ def tool(fn):
 PDF_MAX_BYTES = 30_000_000
 PDF_CACHE_BYTES = 64_000_000
 PDF_TEXT_LIMIT = 8000
+PDF_OCR_PAGE_LIMIT = 5
+PDF_OCR_WARNING = "OCR may misread text, numbers, formulas and reading order."
 _pdf_cache = OrderedDict()
 _pdf_lock = RLock()
 # Serialize the same document without blocking unrelated PDF downloads/extraction.
 _pdf_locks = tuple(RLock() for _ in range(32))
+# PDFium and the shared OCR predictor must not run concurrently across workers.
+_ocr_lock = RLock()
+_ocr_engine = None
 
 
 def _trim_pdf_cache():
@@ -189,6 +195,7 @@ def read_assignment(course_id: int, assignment_id: int) -> dict:
 @tool
 def read_canvas_url(
     url: str, start_page: int = 1, page_count: int = 1, text_offset: int = 0,
+    ocr: str = "auto",
 ) -> dict:
     """Optional shortcut for a discovered Canvas assignment/page/syllabus/PDF URL; PDF pagination matches read_pdf."""
     try:
@@ -216,7 +223,7 @@ def read_canvas_url(
         return read_page(course_id, page[1])
     file = re.fullmatch(r"files/(\d+)(?:/(?:download|preview))?", resource)
     if file:
-        return read_pdf(course_id, int(file[1]), start_page, page_count, text_offset)
+        return read_pdf(course_id, int(file[1]), start_page, page_count, text_offset, ocr)
     return {"error": "Unsupported Canvas URL. Use an assignment, page, syllabus, front page or PDF URL."}
 
 
@@ -338,7 +345,7 @@ def _pdf_document(course_id, file_id):
             raw = _download_pdf(file)
             reader = PdfReader(BytesIO(raw))
             entry = {"version": version, "reader": reader, "total": len(reader.pages),
-                     "texts": {}, "size": len(raw)}
+                     "texts": {}, "ocr_texts": {}, "size": len(raw)}
             del raw
         try:
             yield entry, meta
@@ -357,12 +364,70 @@ def _page_text(entry, number):
     return entry["texts"][number]
 
 
+def _ocr_page(entry, number):
+    """Render only the requested page; no document, image or OCR text hits disk."""
+    global _ocr_engine
+    with _ocr_lock:
+        import pypdfium2 as pdfium
+        from rapidocr import RapidOCR
+
+        if _ocr_engine is None:
+            _ocr_engine = RapidOCR(params={
+                "Global.log_level": "error",
+                "EngineConfig.onnxruntime.intra_op_num_threads": 2,
+                "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+            })
+        with pdfium.PdfDocument(entry["reader"].stream.getvalue()) as pdf:
+            page = pdf[number - 1]
+            try:
+                width, height = page.get_size()
+                if not all(isfinite(value) and value > 0 for value in (width, height)):
+                    raise ValueError("Invalid PDF page dimensions.")
+                # 150 dpi, capped at 2000 px per side (at most 4M pixels).
+                scale = min(150 / 72, 2000 / max(width, height))
+                bitmap = page.render(scale=scale)
+                try:
+                    result = _ocr_engine(bitmap.to_numpy())
+                    return "\n".join(result.txts or ())
+                finally:
+                    bitmap.close()
+            finally:
+                page.close()
+
+
+def _page_content(entry, number, ocr, state):
+    text = _page_text(entry, number)
+    if ocr == "off" or (ocr == "auto" and text.strip()):
+        return text, {} if text.strip() else {"needs_ocr": True}
+    if number not in entry["ocr_texts"]:
+        if "error" not in state:
+            state["attempted"] += 1
+            try:
+                recognized = _ocr_page(entry, number)
+                entry["ocr_texts"][number] = recognized
+                entry["size"] += len(recognized.encode("utf-8"))
+            except ImportError:
+                state["error"] = "OCR unavailable; install local/requirements-ocr.txt and restart the server."
+            except Exception:
+                # Do not expose library errors containing URLs or document text.
+                # Retry on a later call; avoid repeating a failure for every page.
+                state["error"] = "OCR failed; native text retained. Retry or inspect the page visually."
+        if number not in entry["ocr_texts"]:
+            return text, {"needs_ocr": True, "ocr_error": state["error"]}
+    recognized = entry["ocr_texts"][number]
+    if not recognized.strip():
+        return text, {"needs_ocr": True, "ocr_error": "OCR found no readable text; inspect the page visually."}
+    return recognized, {"ocr": True}
+
+
 @tool
 def read_pdf(
     course_id: int, file_id: int, start_page: int = 1,
-    page_count: int = 1, text_offset: int = 0,
+    page_count: int = 1, text_offset: int = 0, ocr: str = "auto",
 ) -> dict:
-    """Read PDF pages in memory (1-based; page_count 1-5). Follow next_page; truncated text: same page, page_count=1, text_offset=next_offset. Report needs_ocr. Cite source/page. Use search_pdf to locate text."""
+    """Read PDF pages (1-based; count 1-5). OCR: auto for empty text, force for mixed scans, off to skip. Follow next_page; truncated: same page/mode, count=1, text_offset=next_offset. Preserve OCR warnings; cite source/page."""
+    if ocr not in ("auto", "off", "force"):
+        return {"error": "ocr must be auto, off or force."}
     if start_page < 1 or not 1 <= page_count <= 5 or text_offset < 0:
         return {"error": "start_page must be positive; page_count 1-5; text_offset nonnegative."}
     if text_offset and page_count != 1:
@@ -375,31 +440,34 @@ def read_pdf(
         if not 1 <= start_page <= total:
             return {**meta, "error": "Invalid page number.", "total_pages": total}
         end = min(start_page + page_count - 1, total)
-        pages = []
+        pages, state = [], {"attempted": 0}
         for number in range(start_page, end + 1):
-            text = _page_text(entry, number)
+            text, info = _page_content(entry, number, ocr, state)
             if text_offset and text_offset >= len(text):
                 return {**meta, "error": "text_offset is beyond the page text.",
                         "page": number, "characters_total": len(text)}
             stop = text_offset + PDF_TEXT_LIMIT
-            row = {"page": number, "text": text[text_offset:stop]}
+            row = {"page": number, "text": text[text_offset:stop], **info}
             if stop < len(text):
                 row.update(truncated=True, next_offset=stop, characters_total=len(text))
             if text_offset:
                 row["text_offset"] = text_offset
-            if not text.strip():
-                row["needs_ocr"] = True
             pages.append(row)
-        return {**meta, "total_pages": total, "pages": pages,
-                "next_page": end + 1 if end < total else None}
+        result = {**meta, "total_pages": total, "pages": pages,
+                  "next_page": end + 1 if end < total else None}
+        if any(row.get("ocr") for row in pages):
+            result["ocr_warning"] = PDF_OCR_WARNING
+        return result
 
 
 @tool
 def search_pdf(
     course_id: int, file_id: int, query: str, start_page: int = 1,
-    page_count: int = 20, max_results: int = 5,
+    page_count: int = 20, max_results: int = 5, ocr: str = "auto",
 ) -> dict:
-    """Find text in PDF pages (max 50/call); first matching snippet per page. Follow next_page; read_pdf for context. Report needs_ocr_pages. Uses shared cache and current access checks."""
+    """Find PDF snippets (max 50 pages, 5 new OCR pages/call). OCR: auto for empty text, force for mixed scans, off to skip. Follow next_page; read_pdf with same OCR mode for context. Preserve OCR warnings/needs_ocr_pages."""
+    if ocr not in ("auto", "off", "force"):
+        return {"error": "ocr must be auto, off or force."}
     query = query.strip()
     if (not 1 <= len(query) <= 200 or start_page < 1
             or not 1 <= page_count <= 50 or not 1 <= max_results <= 10):
@@ -412,23 +480,34 @@ def search_pdf(
         if start_page > total:
             return {**meta, "error": "Invalid page number.", "total_pages": total}
         end = min(start_page + page_count - 1, total)
-        matches, ocr = [], []
+        matches, needs_ocr, ocr_pages, errors = [], [], [], set()
+        state = {"attempted": 0}
         for number in range(start_page, end + 1):
-            text = _page_text(entry, number)
-            if not text.strip():
-                ocr.append(number)
+            text, info = _page_content(entry, number, ocr, state)
+            if info.get("needs_ocr"):
+                needs_ocr.append(number)
+            if info.get("ocr"):
+                ocr_pages.append(number)
+            if info.get("ocr_error"):
+                errors.add(info["ocr_error"])
             match = pattern.search(text)
             if match:
                 offset = max(0, match.start() - 160)
                 matches.append({"page": number, "snippet": text[offset:min(match.end() + 160, offset + 520)],
                                 "text_offset": offset})
-                if len(matches) >= max_results:
-                    break
+                if info.get("ocr"):
+                    matches[-1]["ocr"] = True
+            if len(matches) >= max_results or state["attempted"] >= PDF_OCR_PAGE_LIMIT:
+                break
         result = {**meta, "total_pages": total, "matches": matches,
                   "scanned_pages": {"first": start_page, "last": number},
                   "next_page": number + 1 if number < total else None}
-        if ocr:
-            result["needs_ocr_pages"] = ocr
+        if needs_ocr:
+            result["needs_ocr_pages"] = needs_ocr
+        if ocr_pages:
+            result.update(ocr_pages=ocr_pages, ocr_warning=PDF_OCR_WARNING)
+        if errors:
+            result["ocr_errors"] = sorted(errors)
         return result
 
 

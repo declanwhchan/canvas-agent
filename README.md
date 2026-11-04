@@ -46,6 +46,18 @@ In your AI app or `mcp.json`, go to MCP settings and add a server named `canvas`
 
 Configuration formats vary by app; use its MCP instructions. Enable the server/tools and restart the MCP server after changing code or `.env`.
 
+## Optional: Optical Character Recognition
+
+To turn images into readable text, install local CPU OCR then restart the MCP server:
+
+```
+# Windows
+.\.venv\Scripts\python.exe -m pip install -r requirements-ocr.txt
+
+# macOS / Linux
+.venv/bin/python -m pip install -r requirements-ocr.txt
+```
+
 ## Done!
 
 You can customize [AGENTS.md](AGENTS.md) and try to ask:
