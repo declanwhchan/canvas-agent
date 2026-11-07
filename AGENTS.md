@@ -8,3 +8,4 @@
 - PDFs: `read_pdf` for known pages (default 1, max 5); `search_pdf` locates snippets (max 5 new OCR pages/call). OCR is automatic for empty text; use `ocr="force"` for mixed scans, `"off"` to skip. Follow `next_page`; truncation: same page/OCR mode, `page_count=1`, `text_offset=next_offset`. Read matches for context. Preserve OCR warnings/errors; unread or unrecognized content remains unknown. Verify course/term; report conflicting versions/policies.
 - Cite clickable source links; PDFs need page numbers.
 - Grades: distinguish graded-work average, final percentage points earned, ungraded weight. Apply weights/drops/excusals/exclusions. Never invent weights or zero ungraded work without policy; absent/null means unknown.
+- Generate ONE format per deliverable. Never create duplicates/previews/conversions unless requested. Default to Markdown; PDF for documents, JPG for photos/diagrams/graphs
